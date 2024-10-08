@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from functools import wraps
+from math import ceil
+from typing import List, Union, Any, Optional, Callable, overload, Tuple, cast
 from typing import (
     List, Union, Any, Optional, Callable, Tuple, Literal, overload, cast
 )
@@ -422,11 +424,40 @@ def maybe_parse_duration(value: Union[str, float, int, None]) -> TS:
     return TS(value)
 
 
+def rational(v: Union[str, int, float]) -> float:
+    try:
+        return float(v)
+    except ValueError:
+        if ':' in v:
+            num, den = v.split(':')
+            return float(num) / float(den) if float(den) else 0.0
+        elif '/' in v:
+            num, den = v.split('/')
+            return float(num) / float(den) if float(den) else 0.0
+        else:
+            raise
+
+
 def audio_meta_data(**kwargs: Any) -> AudioMeta:
     duration = maybe_parse_duration(kwargs.get('duration'))
+    bitrate = int(kwargs.get('bit_rate', 0))
+    channels = int(kwargs.get('channel_s') or kwargs.get('channels') or 0)
+    sampling_rate = int(kwargs.get('sampling_rate') or
+                        kwargs.get('sample_rate') or 0)
+    if 'samples_count' in kwargs:
+        samples = int(kwargs['samples_count'])
+    else:
+        # ffprobe does not output samples count at all
+        samples = ceil(duration * sampling_rate)
 
-    stream = kwargs.get('stream')
-    start = TS(kwargs.get('start', 0))
+    stream = kwargs.get('streamorder') or kwargs.get('index')
+    if stream is not None:
+        stream = str(stream)
+    if 'start' in kwargs:
+        start = TS(kwargs['start'])
+    else:
+        start = TS(rational(kwargs.get('start_time', 0)))
+
     scene = Scene(
         stream=stream,
         duration=duration,
@@ -439,10 +470,10 @@ def audio_meta_data(**kwargs: Any) -> AudioMeta:
         streams=[stream] if stream else [],
         duration=duration,
         start=start,
-        bitrate=int(kwargs.get('bit_rate', 0)),
-        channels=int(kwargs.get('channel_s', 0)),
-        sampling_rate=int(kwargs.get('sampling_rate', 0)),
-        samples=int(kwargs.get('samples_count', 0)),
+        bitrate=bitrate,
+        channels=channels,
+        sampling_rate=sampling_rate,
+        samples=samples,
     )
 
 
@@ -450,25 +481,37 @@ def video_meta_data(**kwargs: Any) -> VideoMeta:
     duration = maybe_parse_duration(kwargs.get('duration'))
     width = int(kwargs.get('width', 0))
     height = int(kwargs.get('height', 0))
-    par = float(kwargs.get('pixel_aspect_ratio', 1.0))
+    par = rational(kwargs.get('pixel_aspect_ratio') or
+                   kwargs.get('sample_aspect_ratio' or 1.0))
     try:
-        dar = float(kwargs['display_aspect_ratio'])
+        dar = rational(kwargs['display_aspect_ratio'])
     except KeyError:
         if height == 0:
             dar = float('nan')
         else:
             dar = width / height * par
-    frames = int(kwargs.get('frame_count', 0))
+    frames = int(kwargs.get('frame_count') or kwargs.get('nb_frames') or 0)
     try:
-        frame_rate = float(kwargs['frame_rate'])
+        frame_rate = rational(kwargs.get('frame_rate') or
+                              kwargs.get('r_frame_rate') or
+                              kwargs.get('avg_frame_rate'))
+        if not frame_rate:
+            raise KeyError("frame rate")
     except KeyError:
         if duration.total_seconds() == 0:
             frame_rate = 0
         else:
             frame_rate = frames / duration.total_seconds()
+    bitrate = int(kwargs.get('bit_rate', 0))
 
-    stream = kwargs.get('stream')
-    start = TS(kwargs.get('start', 0))
+    stream = kwargs.get('streamorder') or kwargs.get('index')
+    if stream is not None:
+        stream = str(stream)
+    if 'start' in kwargs:
+        start = TS(kwargs['start'])
+    else:
+        start = TS(rational(kwargs.get('start_time', 0)))
+
     scene = Scene(
         stream=stream,
         duration=duration,
@@ -480,7 +523,7 @@ def video_meta_data(**kwargs: Any) -> VideoMeta:
         streams=[stream] if stream else [],
         duration=duration,
         start=start,
-        bitrate=int(kwargs.get('bit_rate', 0)),
+        bitrate=bitrate,
         width=width,
         height=height,
         par=par,
@@ -498,4 +541,18 @@ def from_media_info(mi: MediaInfo) -> List[Meta]:
             streams.append(video_meta_data(**track.__dict__))
         elif track.track_type == 'Audio':
             streams.append(audio_meta_data(**track.__dict__))
+    return streams
+
+
+def from_ffprobe_json(data: dict[str, Any]) -> List[Meta]:
+    streams: List[Meta] = []
+    for stream in data['streams']:
+        if 'duration' in stream:
+            # Prevent parsing 10.22 as milliseconds
+            stream['duration'] = TS(float(stream['duration']))
+
+        if stream['codec_type'] == 'video':
+            streams.append(video_meta_data(**stream))
+        elif stream['codec_type'] == 'audio':
+            streams.append(audio_meta_data(**stream))
     return streams
